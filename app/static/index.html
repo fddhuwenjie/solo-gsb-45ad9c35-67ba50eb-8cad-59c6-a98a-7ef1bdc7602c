@@ -192,6 +192,21 @@
           <div id="audit-result" class="audit-result hidden"></div>
         </div>
 
+        <div id="merge-panel" class="panel merge-panel hidden">
+          <div class="panel-head">
+            <h2>应用到当前草稿（以旧版为基线、新版为候选）</h2>
+            <div class="hint">逐条勾选要带入的<b>正文</b>、<b>父子顺序 / 层级</b>与<b>删除 / 恢复 / 新增</b>变更，未勾选项保留当前草稿；引用改写与术语绑定不拼接，一律在合并后的文本、顺序、删除状态上重新计算。草稿相对旧版已改动同一条款或其父级的，标为冲突并禁止该项覆盖；过期、阻塞或任一冲突都会整体拒绝，不写部分结果。前置说明不参与带入，始终保留当前草稿</div>
+          </div>
+          <div id="merge-revision" class="merge-revision"></div>
+          <div id="merge-conflict-banner" class="merge-conflict-banner hidden"></div>
+          <div id="merge-items" class="merge-items"></div>
+          <div id="merge-preview" class="merge-preview hidden"></div>
+          <div class="merge-actions">
+            <button id="btn-merge-apply" class="btn btn-primary" type="button" disabled>⤵ 应用勾选到当前草稿</button>
+            <span id="merge-status" class="parse-status"></span>
+          </div>
+        </div>
+
         <div id="version-viewer" class="panel version-viewer hidden"></div>
       </div>
     </section>

@@ -51,6 +51,13 @@ const els = {
   btnAudit: $("#btn-audit"),
   auditStatus: $("#audit-status"),
   auditResult: $("#audit-result"),
+  mergePanel: $("#merge-panel"),
+  mergeRevision: $("#merge-revision"),
+  mergeConflictBanner: $("#merge-conflict-banner"),
+  mergeItems: $("#merge-items"),
+  mergePreview: $("#merge-preview"),
+  btnMergeApply: $("#btn-merge-apply"),
+  mergeStatus: $("#merge-status"),
 };
 
 // 运行时状态
@@ -80,6 +87,13 @@ const state = {
   issueBusy: false,
   // 版本差异审计（只读不可变快照；结果缓存于前端，不随后续草稿变化而失效）
   audit: { oldId: null, newId: null, result: null, busy: false },
+  // 审计结果「应用到当前草稿」
+  merge: {
+    plan: null,          // 最近一次 /api/versions/merge-plan 响应
+    chosen: new Map(),   // cid -> Set(dim)
+    busy: false,
+    reqSeq: 0,           // 预览请求序号（防抖 + 丢弃过期响应）
+  },
 };
 
 const LS_KEY = "clause-rebench-session";
@@ -1747,6 +1761,8 @@ async function runAudit() {
     state.audit = { oldId, newId, result: res, busy: false };
     renderAuditResult(res);
     toast(`v${res.old.version_no} → v${res.new.version_no} 差异审计已生成`);
+    resetMerge();
+    requestMergePlan();
   } catch (e) {
     state.audit.busy = false;
     els.auditStatus.textContent = "审计失败：" + e.message;
@@ -2025,6 +2041,464 @@ function auditLocate(oldCid, newCid, alsoIds = []) {
     .forEach((n) => n.classList.remove("flash")), 2400);
 }
 
+// ================================================================ 应用到当前草稿（审计三方合并）
+
+const MERGE_DIM_META = {
+  body: { label: "带入正文" },
+  order: { label: "带入顺序 / 层级" },
+  lifecycle: { label: "带入删除 / 恢复" },
+  add: { label: "新增带入" },
+};
+const MERGE_DIMS = ["body", "order", "lifecycle", "add"];
+
+function resetMerge() {
+  state.merge = { plan: null, chosen: new Map(), busy: false, reqSeq: 0 };
+  els.mergePanel.classList.add("hidden");
+  els.mergeItems.innerHTML = "";
+  els.mergePreview.classList.add("hidden");
+  els.mergeConflictBanner.classList.add("hidden");
+  els.btnMergeApply.disabled = true;
+  els.mergeStatus.textContent = "";
+}
+
+function mergeContextOk() {
+  // 只能合并回当前已保存、且两版属于它的草稿；本地有未保存修改时禁止（会覆盖）
+  const a = state.audit;
+  if (!a.result || !state.currentDraftId) {
+    return { ok: false, reason: "请先保存并载入当前草稿，再生成审计" };
+  }
+  if (isDraftDirty()) {
+    return { ok: false, reason: "当前草稿有未保存修改；请先保存（或放弃本地改动）后再应用，避免覆盖编辑" };
+  }
+  return { ok: true };
+}
+
+async function requestMergePlan() {
+  const guard = mergeContextOk();
+  if (!guard.ok) {
+    resetMerge();
+    els.mergePanel.classList.remove("hidden");
+    els.mergeRevision.innerHTML =
+      `<span class="merge-guard">⚠ ${esc(guard.reason)}</span>`;
+    els.mergeItems.innerHTML = "";
+    return;
+  }
+  const seq = ++state.merge.reqSeq;
+  const a = state.audit;
+  const selections = mergeSelectionsPayload();
+  try {
+    const plan = await api("/api/versions/merge-plan", {
+      method: "POST",
+      body: JSON.stringify({
+        draft_id: state.currentDraftId,
+        old_version_id: a.oldId,
+        new_version_id: vId(a, "old"),
+        revision: state.savedRevision,
+        selections,
+      }),
+    });
+    if (seq !== state.merge.reqSeq) return; // 已被更新请求取代
+    state.merge.plan = plan;
+    pruneChosen(plan);
+    renderMerge(plan, selections.length > 0);
+  } catch (e) {
+    if (seq !== state.merge.reqSeq) return;
+    if (e.status === 409) {
+      resetMerge();
+      els.mergePanel.classList.remove("hidden");
+      els.mergeRevision.innerHTML =
+        `<span class="merge-guard">⚠ 草稿修订号已过期（服务器最新修订号 ` +
+        `<b>${(e.payload && e.payload.detail && e.payload.detail.current_revision) ?? "?"}</b>）。` +
+        `请载入最新草稿后重新生成审计与合并预览。</span>`;
+    } else if (e.status === 404) {
+      els.mergeStatus.textContent = "⚠ " + e.message;
+    } else {
+      els.mergeStatus.textContent = "合并预览失败：" + e.message;
+    }
+  }
+}
+
+function vId(a, side) {
+  return side === "old" ? a.oldId : a.newId;
+}
+
+function mergeSelectionsPayload() {
+  const out = [];
+  for (const [cid, dims] of state.merge.chosen) {
+    const row = { clause_id: cid };
+    MERGE_DIMS.forEach((d) => { row[d] = dims.has(d); });
+    out.push(row);
+  }
+  return out;
+}
+
+// 计划刷新后清掉已不再可选的勾选（正常不会发生，防御）
+function pruneChosen(plan) {
+  const byId = new Map(plan.items.map((it) => [it.clause_id, it]));
+  for (const [cid, dims] of [...state.merge.chosen]) {
+    const it = byId.get(cid);
+    if (!it) { state.merge.chosen.delete(cid); continue; }
+    for (const d of [...dims]) {
+      if (!it.dims[d] || it.dims[d].status !== "selectable") dims.delete(d);
+    }
+    if (!dims.size) state.merge.chosen.delete(cid);
+  }
+}
+
+function mergeLocHtml(loc) {
+  if (!loc || !loc.present) return `<span class="audit-loc missing">无</span>`;
+  const num = loc.issued_label || loc.label || "";
+  return `<span class="audit-loc${loc.alive ? "" : " dead"}">`
+    + `<b>${esc(num)}</b>${loc.alive ? "" : ' · <em>已删除</em>'}</span>`;
+}
+
+function renderMerge(plan, withSelection) {
+  els.mergePanel.classList.remove("hidden");
+  const a = state.audit.result;
+  const c = plan.counts;
+  els.mergeRevision.innerHTML =
+    `<span>当前草稿修订号 <b>${plan.draft.revision}</b>` +
+    `（旧版 v${plan.old.version_no} → 新版 v${plan.new.version_no}）</span>` +
+    `<span class="merge-count">可选 ${c.selectable} 项 · 冲突 <b class="${c.conflicts ? "tc-danger" : ""}">${c.conflicts}</b> 项</span>`;
+
+  // 冲突总览横幅
+  if (plan.conflicts.length) {
+    els.mergeConflictBanner.classList.remove("hidden");
+    els.mergeConflictBanner.innerHTML =
+      `<div>⚠ 检测到 ${plan.conflicts.length} 个冲突维度：当前草稿相对旧版已改动同一条款或其父级，`
+      + `相关维度已禁用（取消勾选其余项仍可合并）。</div>` +
+      plan.conflicts.slice(0, 8).map((cf) => {
+        const it = plan.items.find((x) => x.clause_id === cf.clause_id);
+        const reason = (cf.reasons[0] || {}).message || "冲突";
+        const loc = it ? it.old_loc : null;
+        return `<button type="button" class="merge-conflict-chip" data-cid="${cf.clause_id}">`
+          + mergeLocHtml(loc) + `<span>${esc(MERGE_DIM_META[cf.dim].label)}：${esc(reason)}</span></button>`;
+      }).join("");
+    els.mergeConflictBanner.querySelectorAll(".merge-conflict-chip")
+      .forEach((btn) => btn.addEventListener("click", () =>
+        mergeLocate(btn.dataset.cid)));
+  } else {
+    els.mergeConflictBanner.classList.add("hidden");
+  }
+
+  // 逐条可选项
+  els.mergeItems.innerHTML = "";
+  plan.items.forEach((it) => {
+    const anyDim = MERGE_DIMS.some((d) => it.dims[d].status !== "none");
+    if (!anyDim) return;
+    const row = document.createElement("div");
+    row.className = "merge-item";
+    row.dataset.cid = it.clause_id;
+
+    const head = document.createElement("div");
+    head.className = "merge-item-head";
+    const heading = it.heading || "（无正文）";
+    head.innerHTML =
+      `<span class="merge-item-locs">` +
+      `<span class="merge-side-tag">草稿</span>${mergeLocHtml(it.draft_loc)}` +
+      `<span class="audit-arrow">→</span>` +
+      `<span class="merge-side-tag">旧版</span>${mergeLocHtml(it.old_loc)}` +
+      `<span class="audit-arrow">→</span>` +
+      `<span class="merge-side-tag">新版</span>${mergeLocHtml(it.new_loc)}` +
+      `</span><span class="merge-item-heading">${esc(heading)}</span>`;
+    head.addEventListener("click", () => mergeLocate(it.clause_id));
+    row.appendChild(head);
+
+    const dims = document.createElement("div");
+    dims.className = "merge-dims";
+    MERGE_DIMS.forEach((dim) => {
+      const st = it.dims[dim];
+      if (st.status === "none") return;
+      const label = document.createElement("label");
+      label.className = "merge-dim " + st.status;
+      const conflictMsgs = (st.reasons || []).map((r) => r.message).join("；");
+      const lifeTag = dim === "lifecycle" && it.lifecycle_action === "delete" ? "（删除）"
+        : dim === "lifecycle" && it.lifecycle_action === "restore" ? "（恢复）" : "";
+      label.innerHTML =
+        `<input type="checkbox" ${st.status === "selectable" ? "" : "disabled"} />` +
+        `<span>${MERGE_DIM_META[dim].label}${lifeTag}</span>` +
+        (st.status === "conflict"
+          ? `<span class="merge-dim-why" title="${esc(conflictMsgs)}">⚠ 冲突</span>`
+          : st.status === "already"
+            ? `<span class="merge-dim-why ok">已与新版一致</span>` : "");
+      if (conflictMsgs) label.title = conflictMsgs;
+      const check = label.querySelector("input");
+      const cur = state.merge.chosen.get(it.clause_id);
+      check.checked = !!(cur && cur.has(dim));
+      if (st.status === "selectable") {
+        check.addEventListener("change", () => {
+          let set = state.merge.chosen.get(it.clause_id);
+          if (!set) { set = new Set(); state.merge.chosen.set(it.clause_id, set); }
+          if (check.checked) set.add(dim); else set.delete(dim);
+          if (!set.size) state.merge.chosen.delete(it.clause_id);
+          scheduleMergePlan();
+        });
+      }
+      dims.appendChild(label);
+    });
+    row.appendChild(dims);
+    els.mergeItems.appendChild(row);
+  });
+
+  // 三侧条款快照（当前草稿 / 旧版 / 新版）：冲突定位用
+  renderMergeSidesThree(plan);
+
+  // 合并后预览（含阻塞项）
+  renderMergePreview(plan, withSelection);
+
+  const chosenCount = mergeSelectionsPayload()
+    .reduce((n, r) => n + MERGE_DIMS.filter((d) => r[d]).length, 0);
+  els.btnMergeApply.disabled = chosenCount === 0 || state.merge.busy
+    || !!(plan.merged && plan.merged.has_blockers);
+  els.btnMergeApply.textContent = chosenCount
+    ? `⤵ 应用勾选到当前草稿（${chosenCount} 项变更）`
+    : "⤵ 应用勾选到当前草稿";
+}
+
+function renderMergePreview(plan, withSelection) {
+  const m = plan.merged;
+  if (!m) {
+    els.mergePreview.classList.add("hidden");
+    els.mergePreview.innerHTML = "";
+    return;
+  }
+  els.mergePreview.classList.remove("hidden");
+  const blockers = m.blockers || { reference_issues: [], term_issues: [] };
+  const nRef = blockers.reference_issues.length;
+  const nTerm = blockers.term_issues.length;
+  let html = `<div class="merge-preview-head ${nRef + nTerm ? "bad" : "ok"}">`
+    + (nRef + nTerm
+      ? `⚠ 合并后重算发现阻塞项：引用 ${nRef} / 术语 ${nTerm} —— 提交将被整体拒绝`
+      : "✓ 合并后重算引用改写与术语绑定：无阻塞项，可提交")
+    + `（合并后存活 ${m.order.length} 条 · 删除 ${m.deleted.length} 条）</div>`;
+
+  if (nRef) {
+    html += `<div class="merge-blocker-sec"><div class="issue-blocker-title">引用问题 ${nRef} 项</div>`
+      + blockers.reference_issues.map((it) => {
+        const tag = ISSUE_META[it.type] ? ISSUE_META[it.type].tag : it.type;
+        return `<button type="button" class="issue-blocker-row ref ${it.type}" data-ref='${JSON.stringify(it).replace(/'/g, "&#39;")}">`
+          + `<span class="chip-tag">${tag}</span><span class="chip-msg">${esc(it.message)}</span></button>`;
+      }).join("") + `</div>`;
+  }
+  if (nTerm) {
+    html += `<div class="merge-blocker-sec"><div class="issue-blocker-title">术语问题 ${nTerm} 项（未忽略）</div>`
+      + blockers.term_issues.map((it) =>
+        `<button type="button" class="issue-blocker-row term ${it.type}" data-occ="${esc(it.occ_id)}">`
+        + `<span class="chip-tag">${TERM_ISSUE_META[it.type].tag}</span>`
+        + `<span class="chip-msg">${esc(it.message)}</span></button>`).join("")
+      + `</div>`;
+  }
+  els.mergePreview.innerHTML = html;
+
+  els.mergePreview.querySelectorAll(".issue-blocker-row.ref").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const it = JSON.parse(btn.dataset.ref);
+      switchMode("refs").then(() => locate(it.clause_id, it.target_id));
+    });
+  });
+  els.mergePreview.querySelectorAll(".issue-blocker-row.term").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      switchMode("terms").then(() => locateTerm(btn.dataset.occ));
+    });
+  });
+
+  renderMergeSides(plan);
+}
+
+// 三侧并排快照：当前草稿 / 旧版基线 / 新版候选（点击可选项或冲突芯片时定位）
+function renderMergeSidesThree(plan) {
+  let sec = $("#merge-three-sides");
+  if (sec) sec.remove();
+  sec = document.createElement("div");
+  sec.id = "merge-three-sides";
+  sec.className = "audit-sides merge-three";
+  sec.innerHTML =
+    `<div class="audit-section-title">三侧条款快照（当前草稿 / 旧版基线 / 新版候选；已删除置灰）</div>`;
+  const cols = document.createElement("div");
+  cols.className = "compare-cols merge-three-cols";
+
+  const mkCol = (sideKey, title, side) => {
+    const col = document.createElement("div");
+    col.className = "col";
+    col.innerHTML = `<div class="col-title">${title}</div>`;
+    const view = document.createElement("div");
+    view.className = "doc-view audit-doc";
+    view.dataset.side = sideKey;
+    if (side.preamble) {
+      const p = document.createElement("div");
+      p.className = "preamble-block clause-block";
+      p.dataset.cid = "preamble";
+      p.textContent = side.preamble;
+      view.appendChild(p);
+    }
+    side.result.forEach((c) => view.appendChild(vMakeBlock(c, "after", false)));
+    (side.deleted_clauses || []).forEach((mini) => {
+      const full = (side.clauses || []).find((c) => c.id === mini.id);
+      if (full) view.appendChild(vMakeBlock(full, "before", true));
+    });
+    col.appendChild(view);
+    return col;
+  };
+  cols.appendChild(mkCol("draft", "当前草稿", plan.sides.draft));
+  cols.appendChild(mkCol("old", `旧版 v${plan.sides.old.version_no}`, plan.sides.old));
+  cols.appendChild(mkCol("new", `新版 v${plan.sides.new.version_no}`, plan.sides.new));
+  sec.appendChild(cols);
+  els.mergePanel.insertBefore(sec, els.mergePreview);
+}
+
+// 合并后预览快照：复用 vMakeBlock（合并结果的 clauses/result 结构与版本快照一致）
+function renderMergeSides(plan) {
+  const oldSec = document.createElement("div");
+  oldSec.className = "audit-sides merge-sides";
+  oldSec.innerHTML =
+    `<div class="audit-section-title">合并后预览（在合并文本 / 顺序 / 删除状态上重算：左原文、右重编号与引用改写；已删除置灰，点击上方可选项可在三侧与预览间定位）</div>`;
+  const cols = document.createElement("div");
+  cols.className = "compare-cols";
+
+  const m = plan.merged;
+  const mkCol = (title, refResult) => {
+    const col = document.createElement("div");
+    col.className = "col";
+    col.innerHTML = `<div class="col-title">${title}</div>`;
+    const view = document.createElement("div");
+    view.className = "doc-view audit-doc";
+    view.dataset.mpreview = "1";
+    if (refResult.preamble) {
+      const p = document.createElement("div");
+      p.className = "preamble-block clause-block";
+      p.dataset.cid = "preamble";
+      p.textContent = refResult.preamble;
+      view.appendChild(p);
+    }
+    refResult.result.forEach((c) => view.appendChild(vMakeBlock(c, "after", false)));
+    const deletedIds = new Set(refResult.deleted_clauses.map((c) => c.id));
+    refResult.clauses.forEach((c) => {
+      if (deletedIds.has(c.id)) view.appendChild(vMakeBlock(c, "before", true));
+    });
+    col.appendChild(view);
+    return col;
+  };
+  cols.appendChild(mkCol("合并后原文（含删除置灰）", m.ref_result));
+  cols.appendChild(mkCol("合并后重编号 / 引用改写", m.ref_result));
+  oldSec.appendChild(cols);
+  els.mergePreview.appendChild(oldSec);
+}
+
+const scheduleMergePlan = debounce(() => requestMergePlan(), 250);
+
+// 三侧 + 合并预览定位
+function mergeLocate(cid) {
+  const box = els.mergePanel;
+  const plan = state.merge.plan;
+  if (!plan) return;
+  const views = [
+    ...box.querySelectorAll(".audit-doc[data-side]"),
+    ...box.querySelectorAll(".audit-doc[data-mpreview]"),
+  ];
+  let scrolled = false;
+  views.forEach((view) => {
+    view.querySelectorAll(".clause-block").forEach((node) => {
+      if (node.dataset.cid === cid || node.dataset.cid === "preamble" && cid === "preamble") {
+        if (!scrolled) {
+          node.scrollIntoView({ behavior: "smooth", block: "center" });
+          scrolled = true;
+        }
+        node.classList.remove("flash");
+        void node.offsetWidth;
+        node.classList.add("flash");
+      }
+    });
+  });
+  setTimeout(() => box.querySelectorAll(".clause-block.flash")
+    .forEach((n) => n.classList.remove("flash")), 2400);
+  // 同时在审计结果的两版快照中定位
+  if (state.audit.result) auditLocate(cid, cid);
+}
+
+async function applyMerge() {
+  const plan = state.merge.plan;
+  const guard = mergeContextOk();
+  if (!plan || !guard.ok) { toast(guard.reason || "无合并计划"); return; }
+  if (state.merge.busy) return;
+  if (!mergeSelectionsPayload().length) { toast("请先勾选要带入的变更"); return; }
+  if (plan.merged && plan.merged.has_blockers) {
+    toast("合并后存在阻塞项，已禁止提交");
+    return;
+  }
+  state.merge.busy = true;
+  els.btnMergeApply.disabled = true;
+  els.btnMergeApply.textContent = "合并提交中…";
+  els.mergeStatus.textContent = "";
+  try {
+    const res = await api(`/api/drafts/${state.currentDraftId}/merge`, {
+      method: "POST",
+      body: JSON.stringify({
+        draft_id: state.currentDraftId,
+        old_version_id: state.audit.oldId,
+        new_version_id: state.audit.newId,
+        revision: state.savedRevision,
+        old_fingerprint: plan.old.fingerprint,
+        new_fingerprint: plan.new.fingerprint,
+        selections: mergeSelectionsPayload(),
+      }),
+    });
+    // 一次事务已保存新修订：用返回的合并结果直接更新工作区
+    els.input.value = res.content;
+    state.order = res.order;
+    state.deleted = res.deleted;
+    state.termIgnores = res.term_ignores || [];
+    state.savedRevision = res.revision;
+    await runAnalyze(true);
+    state.savedSnapshot = draftSnapshot();
+    refreshDrafts(state.currentDraftId);
+    toast(`已应用 ${res.applied.length} 条变更并保存为新修订号 ${res.revision}（引用改写与术语绑定已重算）`);
+    // 重新生成审计页版本列表与合并计划（草稿修订号已变）
+    await refreshVersionList();
+    // 以同一对版本重新生成审计（版本不可变，差异结构不变），再按新草稿重建合并计划
+    const keepOld = state.audit.oldId;
+    const keepNew = state.audit.newId;
+    state.audit = { oldId: keepOld, newId: keepNew, result: null, busy: false };
+    try {
+      const res = await api("/api/versions/audit", {
+        method: "POST",
+        body: JSON.stringify({ old_version_id: keepOld, new_version_id: keepNew }),
+      });
+      state.audit.result = res;
+      renderAuditResult(res);
+    } catch (_) { /* 版本仍在，失败可忽略 */ }
+    resetMerge();
+    // 原审计结果仍可查看（只读版本行不受影响），但合并面板按新草稿状态重建
+    requestMergePlan();
+  } catch (e) {
+    if (e.status === 409) {
+      const detail = e.payload && e.payload.detail;
+      els.mergeStatus.innerHTML = "⚠ " + esc((detail && detail.message) || e.message)
+        + (detail && detail.current_revision
+          ? ` <button type="button" class="btn btn-sm" id="merge-reload">载入服务器最新草稿（修订号 ${detail.current_revision}）</button>` : "");
+      const reload = $("#merge-reload");
+      if (reload) reload.addEventListener("click", async () => {
+        await loadDraft(state.currentDraftId);
+        await refreshVersionList();
+        resetMerge();
+        requestMergePlan();
+      });
+    } else if (e.status === 422) {
+      const detail = e.payload && e.payload.detail;
+      els.mergeStatus.textContent = "⚠ " + ((detail && detail.message) || e.message);
+      // 重新拉取计划，把冲突 / 阻塞项刷新到页面
+      state.merge.reqSeq++;
+      await requestMergePlan();
+      toast("合并被整体拒绝，草稿未写入");
+      return;
+    } else {
+      els.mergeStatus.textContent = "合并失败：" + e.message;
+    }
+  } finally {
+    state.merge.busy = false;
+    if (state.merge.plan) renderMerge(state.merge.plan, true);
+  }
+}
+
 // ---------------------------------------------------------------- 草稿（SQLite）
 async function refreshDrafts(selectId) {
   try {
@@ -2151,6 +2625,7 @@ async function loadDraft(id) {
   state.activeVersion = null;
   state.versionsLoadedFor = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
+  resetMerge();
   els.versionViewer.classList.add("hidden");
   els.auditResult.classList.add("hidden");
   els.auditStatus.textContent = "";
@@ -2249,6 +2724,7 @@ function loadExample() {
   state.versionsLoadedFor = null;
   state.activeVersion = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
+  resetMerge();
   state.previewSel = [];
   state.previewResult = null;
   state.previewStale = false;
@@ -2282,6 +2758,7 @@ els.tabTerms.addEventListener("click", () => switchMode("terms"));
 els.tabVersions.addEventListener("click", () => switchMode("versions"));
 els.btnIssue.addEventListener("click", issueVersion);
 els.btnAudit.addEventListener("click", runAudit);
+els.btnMergeApply.addEventListener("click", applyMerge);
 els.auditOld.addEventListener("change", () => {
   state.audit.oldId = Number(els.auditOld.value) || null;
   renderAuditForm();

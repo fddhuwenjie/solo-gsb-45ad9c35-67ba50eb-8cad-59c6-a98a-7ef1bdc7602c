@@ -658,3 +658,70 @@ textarea:focus { outline: none; border-color: var(--primary); }
 .audit-doc .clause-block.flash {
   outline: 2px solid var(--flash); background: rgba(255,243,196,.12);
 }
+
+/* ============================================================ 应用到当前草稿（审计三方合并） */
+.merge-panel { margin-top: 14px; border-left: 3px solid var(--primary); }
+.merge-revision {
+  display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
+  font-size: 13px; color: var(--muted); margin: 4px 2px 10px;
+}
+.merge-revision b { color: var(--text); }
+.merge-count .tc-danger { color: var(--danger); }
+.merge-guard { color: var(--warn); }
+.merge-conflict-banner {
+  border: 1px solid var(--danger); background: rgba(255,107,107,.08);
+  border-radius: 8px; padding: 8px 12px; margin-bottom: 10px;
+  font-size: 12.5px; color: var(--text);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.merge-conflict-chip {
+  display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
+  background: transparent; border: 1px solid var(--danger);
+  color: var(--text); border-radius: 6px; padding: 3px 8px;
+  font-size: 12px; cursor: pointer; max-width: 100%;
+}
+.merge-conflict-chip:hover { background: rgba(255,107,107,.12); }
+.merge-items { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.merge-item {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; background: rgba(255,255,255,.02);
+}
+.merge-item:has(.merge-dim.conflict) { border-left: 3px solid var(--danger); }
+.merge-item-head {
+  display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center;
+  cursor: pointer; font-size: 12.5px;
+}
+.merge-item-locs { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.merge-item-heading { color: var(--muted); }
+.merge-side-tag {
+  font-size: 10.5px; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 4px; margin-right: 2px;
+}
+.merge-dims { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 7px; }
+.merge-dim {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; cursor: pointer; user-select: none;
+}
+.merge-dim.conflict { color: var(--danger); cursor: not-allowed; }
+.merge-dim.already { color: var(--muted); cursor: default; }
+.merge-dim input { accent-color: var(--primary); }
+.merge-dim-why {
+  font-size: 11px; border: 1px solid var(--danger); border-radius: 4px;
+  padding: 0 5px; color: var(--danger);
+}
+.merge-dim-why.ok { color: var(--ok); border-color: var(--ok); }
+.merge-actions {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);
+}
+.merge-preview {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin: 6px 0 10px;
+}
+.merge-preview-head { font-size: 13px; margin-bottom: 8px; }
+.merge-preview-head.ok { color: var(--ok); }
+.merge-preview-head.bad { color: var(--danger); }
+.merge-blocker-sec { margin: 6px 0; }
+.merge-three .merge-three-cols .col { min-width: 0; }
+.merge-three .col-title { font-size: 12.5px; }
+.merge-three-cols { grid-template-columns: 1fr 1fr 1fr; }
