@@ -189,6 +189,21 @@
             <button id="btn-audit" class="btn btn-primary" type="button" disabled>🔍 生成版本差异审计</button>
             <span id="audit-status" class="parse-status"></span>
           </div>
+          <div id="apply-pane" class="apply-pane hidden">
+            <div class="panel-head">
+              <h2>应用到当前草稿</h2>
+              <div class="hint">以审计旧版为基线、新版为候选，逐条勾选要带入的正文 / 父子顺序层级 / 删除或恢复变更；未选项保留当前草稿。引用改写与术语绑定<b>不直接拼接</b>，在合并后的文本、顺序、删除状态上重新计算。当前草稿相对旧版已改动同一条款或其父级时标为冲突并禁止该项覆盖</div>
+            </div>
+            <div id="apply-banner" class="apply-banner"></div>
+            <div class="apply-toolbar">
+              <label class="apply-selectall"><input type="checkbox" id="apply-selectall" /> 全选无冲突项</label>
+              <span id="apply-summary" class="apply-summary"></span>
+              <button id="btn-apply-fetch" class="btn btn-sm" type="button">重新载入合并预览</button>
+              <button id="btn-apply-submit" class="btn btn-primary" type="button">✓ 应用勾选项到当前草稿（一次事务保存新修订）</button>
+            </div>
+            <div id="apply-items" class="apply-items"></div>
+            <div id="apply-sides" class="apply-sides"></div>
+          </div>
           <div id="audit-result" class="audit-result hidden"></div>
         </div>
 

@@ -10,7 +10,10 @@
 同一草稿的任意两个已签发版本还可生成
 **「版本差异审计」**——按原条款稳定 ID 对齐两份快照，区分正文改变 / 层级顺序调整 /
 删除新增 / 仅编号改写，逐条比较引用目标、区间表达与术语绑定，并对目标删除或绑定
-改变的差异从新版存活引用图计算最短受影响链（合并循环组），结果稳定排序且两版可点击定位。
+改变的差异从新版存活引用图计算最短受影响链（合并循环组），结果稳定排序且两版可点击定位；
+审计页还可**「应用到当前草稿」**：以旧版为基线、新版为候选逐条勾选带入正文、父子顺序
+层级与删除 / 恢复变更，引用改写与术语绑定在合并结果上重新计算，草稿相对旧版已改动同条
+或其父级即标冲突禁覆，过期 / 阻塞 / 冲突均整体拒绝，通过后一次事务保存新修订。
 
 ## 功能
 
@@ -139,6 +142,28 @@
   页面点击任意差异行或链节点，即在下方**两版并排快照**（旧版原文、新版签发
   正文，已删除条款置灰）中同时高亮两侧条款。审计结果不写库、不占版本号。
 
+#### 应用到当前草稿（审计页「应用到当前草稿」）
+
+- **旧版为基线、新版为候选、当前草稿为工作副本**：在审计结果下方逐条勾选
+  要带入的变更，维度独立勾选——**正文**、**父子顺序 / 层级**、
+  **删除或恢复**（新版相对旧版整体新增 / 移除为**新增 / 移除**维度）；
+  未勾选项一律保留当前草稿；仅编号改写无需勾选（合并后随重排自动重算）。
+- **引用改写与术语绑定绝不直接拼接**：合并只搬运文本块、顺序与删除标记，
+  随后在**合并后的文本、顺序、删除状态**上重新解析、级联删除、重排、
+  引用改写与术语绑定审校；候选版本签发时的改写文本与绑定结果不进入草稿。
+- **冲突检测（按维度禁用勾选）**：当前草稿相对旧版已改动**同一条款**
+  （正文 / 层级顺序 / 删除状态任一维度）、已改动其**任一祖先条款**，
+  或删除 / 移除时**子树内已有草稿改动**，相关勾选项标为冲突、禁止覆盖，
+  页面在三侧快照（旧版 / 新版 / 当前草稿）中给出冲突原因与定位。
+- **提交一次事务保存为新修订**：提交须携带草稿修订号与两版本快照指纹；
+  修订号过期（409）、合并结果存在引用 / 术语阻塞（422）或勾选了任一冲突
+  维度（422）均**整体拒绝、不写任何部分结果**；通过后在同一
+  `BEGIN IMMEDIATE` 事务内保存为草稿的新 `revision`（+1），引用重排、
+  术语审校、已签发版本与审计快照均不受影响。
+- **页面操作**：生成审计后自动载入合并预览（也可「重新载入合并预览」），
+  支持全选无冲突项、预览冲突、点击条目在三侧条款间定位；提交成功后工作区
+  自动切换到合并后的草稿（引用改写与术语绑定均为重算结果）。
+
 ## 技术栈
 
 - 后端：Python · FastAPI · SQLite（`uvicorn` 提供服务）
@@ -181,6 +206,8 @@ uvicorn app.main:app --reload --port 8000
 | GET | `/api/drafts/{id}/versions` | 该草稿的不可变版本列表（含摘要，不含正文快照） |
 | GET | `/api/versions/{id}` | 查看单个版本的完整不可变快照（正文、编号、引用改写、术语绑定） |
 | POST | `/api/versions/audit` | **版本差异审计**：入参 `{old_version_id, new_version_id}`，须为同草稿的两个不同版本；返回条款 / 引用 / 术语差异、最短受影响链与两版快照 |
+| POST | `/api/drafts/{id}/apply-preview` | **应用到当前草稿（只读预览）**：入参 `{old_version_id, new_version_id}`；返回逐条可勾选变更（含按维度的冲突与原因）、计数与旧版 / 新版 / 草稿三侧快照 |
+| POST | `/api/drafts/{id}/apply-audit` | **应用到当前草稿（提交）**：入参 `{old_version_id, new_version_id, revision, old_fingerprint, new_fingerprint, selections}`；过期 → 409，冲突 / 阻塞 → 422（均不写部分结果），通过则一次事务保存新修订并返回合并后的草稿四要素 |
 | GET | `/api/health` | 健康检查 |
 
 签发接口的拒绝响应：
@@ -297,6 +324,103 @@ curl -s -X POST http://localhost:8000/api/versions/audit \
 「🔍 生成版本差异审计」，差异清单与受影响链均可点击，在下方两版快照中定位
 对应条款。
 
+## 「应用到当前草稿」调用示例
+
+> 前置：当前草稿（id=1）至少有两个已签发版本（下面示例为 v1=id1、v2=id2），
+> 且审计方向固定为**旧版 v1（基线）→ 新版 v2（候选）**。先只读预览拿到
+> 可勾选条目、冲突与两版本指纹，再按用户勾选提交。
+
+```bash
+# 1) 只读预览：逐条差异、按维度冲突、三侧快照（不写任何状态）
+curl -s -X POST http://localhost:8000/api/drafts/1/apply-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"old_version_id": 1, "new_version_id": 2}'
+```
+
+返回结构（节选）：
+
+```json
+{
+  "draft_id": 1,
+  "draft_revision": 5,
+  "old": {"id": 1, "version_no": 1, "fingerprint": "…"},
+  "new": {"id": 2, "version_no": 2, "fingerprint": "…"},
+  "counts": {"items": 3, "conflict_items": 1, "selectable_dimensions": 3},
+  "items": [
+    {
+      "clause_id": "c-3",
+      "kind": "body_changed",
+      "dimensions": [
+        {"dim": "body", "label": "正文", "conflict": false, "conflict_reasons": []}
+      ],
+      "conflict": false,
+      "conflict_reasons": [],
+      "locs": {"old": {"issued_label": "第3条", "alive": true, "…": "…"},
+               "new": {"issued_label": "第2条", "alive": true, "…": "…"},
+               "draft": {"issued_label": "第3条", "alive": true, "…": "…"}}
+    },
+    {
+      "clause_id": "c-4",
+      "kind": "lifecycle_deleted",
+      "dimensions": [
+        {"dim": "lifecycle", "label": "删除 / 恢复", "conflict": true,
+         "conflict_reasons": ["当前草稿相对旧版已改动本条款（正文）"]}
+      ],
+      "conflict": true,
+      "conflict_reasons": ["当前草稿相对旧版已改动本条款（正文）"]
+    }
+  ],
+  "sides": {"old": {"…": "两版并排快照同审计"},
+            "new": {"…": "…"},
+            "draft": {"version_no": 0, "clauses": ["…"], "result": ["…"]}}
+}
+```
+
+```bash
+# 2) 提交勾选（revision 与两版本指纹来自预览；未选项保留当前草稿）
+curl -s -X POST http://localhost:8000/api/drafts/1/apply-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "old_version_id": 1,
+    "new_version_id": 2,
+    "revision": 5,
+    "old_fingerprint": "<预览返回的 old.fingerprint>",
+    "new_fingerprint": "<预览返回的 new.fingerprint>",
+    "selections": [
+      {"clause_id": "c-3", "dimensions": ["body"]},
+      {"clause_id": "c-2", "dimensions": ["structure"]},
+      {"clause_id": "c-5", "dimensions": ["presence"]}
+    ]
+  }'
+```
+
+成功返回（合并后的草稿四要素，引用 / 术语均为重算结果）：
+
+```json
+{
+  "ok": true,
+  "revision": 6,
+  "applied": [
+    {"clause_id": "c-2", "dimensions": ["structure"]},
+    {"clause_id": "c-3", "dimensions": ["body"]},
+    {"clause_id": "c-5", "dimensions": ["presence"]}
+  ],
+  "draft": {"content": "…", "order": ["c-1", "c-3", "c-2", "c-4", "c-5"],
+            "deleted": [], "term_ignores": []}
+}
+```
+
+拒绝响应（**均不写部分结果**）：
+
+- `409`：`revision` 过期（草稿已被其他保存改动）或版本指纹不符，
+  `detail.current_revision` 给出服务器最新修订号，需重新载入草稿并重做预览；
+- `422`（冲突）：`detail.conflicts[]` 列出 `{clause_id, dimension, message}`，
+  前端按维度禁用对应勾选并可在三侧快照定位；
+- `422`（阻塞）：`detail.blockers.reference_issues / term_issues`
+  给出合并后重算仍存在的引用 / 术语问题（术语阻塞扣除草稿既有忽略项）；
+- `400`：选择为空、条目 / 维度不存在或不适用于该差异；
+  `404`：草稿或版本不存在；跨草稿应用 → `400`。
+
 ## 目录结构
 
 ```
@@ -308,6 +432,7 @@ app/
   preview.py       删除影响预演：删除前后绑定差异 + 反向引用最短原因链
   issuance.py      生效版本签发：快照固定、终审阻塞项校验、指纹与摘要
   audit.py         版本差异审计：稳定 ID 对齐、引用/术语差异、SCC 最短受影响链
+  merge.py         审计应用到草稿：旧版/新版/草稿三方合并、冲突检测与重算
   static/          前端（index.html / styles.css / app.js，含三个页签）
 data/              SQLite 数据（Docker 中为命名卷 /data，自动创建）
 docker-compose.yml

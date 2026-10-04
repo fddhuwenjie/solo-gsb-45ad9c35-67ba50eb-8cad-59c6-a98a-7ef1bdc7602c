@@ -51,6 +51,14 @@ const els = {
   btnAudit: $("#btn-audit"),
   auditStatus: $("#audit-status"),
   auditResult: $("#audit-result"),
+  applyPane: $("#apply-pane"),
+  applyBanner: $("#apply-banner"),
+  applySelectAll: $("#apply-selectall"),
+  applySummary: $("#apply-summary"),
+  btnApplyFetch: $("#btn-apply-fetch"),
+  btnApplySubmit: $("#btn-apply-submit"),
+  applyItems: $("#apply-items"),
+  applySides: $("#apply-sides"),
 };
 
 // 运行时状态
@@ -78,8 +86,15 @@ const state = {
   versionsLoadedFor: null,
   activeVersion: null,  // 正在查看的版本详情
   issueBusy: false,
-  // 版本差异审计（只读不可变快照；结果缓存于前端，不随后续草稿变化而失效）
+  // 版本差异审计（只读不可变快照；结果缓存于前端，不随后续草稿被改而失效）
   audit: { oldId: null, newId: null, result: null, busy: false },
+  // 应用到当前草稿（旧版基线 → 新版候选的三方合并）
+  apply: {
+    busy: false,          // 预览 / 提交请求进行中
+    preview: null,        // 最近一次 apply-preview 响应
+    selections: new Map(), // cid -> Set(dimension)，勾选状态在重新预览间保留
+    seen: false,
+  },
 };
 
 const LS_KEY = "clause-rebench-session";
@@ -276,6 +291,10 @@ async function runAnalyze(structureChanged = false) {
     invalidatePreview();
     fetchTerms();
     if (state.mode === "versions") renderIssuePanel();
+    if (state.apply.preview) {
+      renderApplyBanner(state.apply.preview);
+      updateApplySummary();
+    }
   } catch (e) {
     els.status.textContent = "分析失败：" + e.message;
     throw e;
@@ -1747,6 +1766,8 @@ async function runAudit() {
     state.audit = { oldId, newId, result: res, busy: false };
     renderAuditResult(res);
     toast(`v${res.old.version_no} → v${res.new.version_no} 差异审计已生成`);
+    // 同步拉取「应用到当前草稿」预览（只读；草稿不在该版本所属草稿时由后端拒绝）
+    fetchApplyPreview();
   } catch (e) {
     state.audit.busy = false;
     els.auditStatus.textContent = "审计失败：" + e.message;
@@ -2025,7 +2046,395 @@ function auditLocate(oldCid, newCid, alsoIds = []) {
     .forEach((n) => n.classList.remove("flash")), 2400);
 }
 
-// ---------------------------------------------------------------- 草稿（SQLite）
+// ================================================================ 应用到当前草稿
+
+const APPLY_DIM_LABELS = {
+  body: "正文",
+  structure: "父子顺序 / 层级",
+  lifecycle: "删除 / 恢复",
+  presence: "新增 / 移除",
+};
+
+function applyStale() {
+  const p = state.apply.preview;
+  if (!p) return false;
+  return p.draft_revision !== state.savedRevision || isDraftDirty();
+}
+
+function applySelectedPairs() {
+  const out = [];
+  for (const [cid, dims] of state.apply.selections) {
+    if (dims.size) out.push({ clause_id: cid, dimensions: [...dims] });
+  }
+  return out;
+}
+
+async function fetchApplyPreview() {
+  const { oldId, newId } = state.audit;
+  if (!state.currentDraftId || !oldId || !newId) {
+    els.applyPane.classList.add("hidden");
+    return;
+  }
+  state.apply.busy = true;
+  els.btnApplyFetch.disabled = true;
+  els.btnApplyFetch.textContent = "载入中…";
+  try {
+    const res = await api(
+      `/api/drafts/${state.currentDraftId}/apply-preview`, {
+        method: "POST",
+        body: JSON.stringify({ old_version_id: oldId, new_version_id: newId }),
+      });
+    state.apply.preview = res;
+    state.apply.seen = true;
+    pruneApplySelections();
+    els.applyPane.classList.remove("hidden");
+    renderApply();
+  } catch (e) {
+    els.applyPane.classList.add("hidden");
+    els.auditStatus.textContent = "合并预览不可用：" + e.message;
+  } finally {
+    state.apply.busy = false;
+    els.btnApplyFetch.disabled = false;
+    els.btnApplyFetch.textContent = "重新载入合并预览";
+  }
+}
+
+function pruneApplySelections() {
+  const p = state.apply.preview;
+  const allowed = new Map();
+  p.items.forEach((it) => {
+    allowed.set(it.clause_id, new Set(
+      it.dimensions.filter((d) => !d.conflict).map((d) => d.dim)));
+  });
+  for (const [cid, dims] of [...state.apply.selections]) {
+    const ok = allowed.get(cid);
+    if (!ok) { state.apply.selections.delete(cid); continue; }
+    const kept = [...dims].filter((d) => ok.has(d));
+    if (kept.length) state.apply.selections.set(cid, new Set(kept));
+    else state.apply.selections.delete(cid);
+  }
+}
+
+function renderApply() {
+  const p = state.apply.preview;
+  if (!p) { els.applyPane.classList.add("hidden"); return; }
+  els.applyPane.classList.remove("hidden");
+  renderApplyBanner(p);
+  renderApplyItems(p);
+  renderApplySides(p);
+  updateApplySummary();
+}
+
+function renderApplyBanner(p) {
+  els.applyBanner.className = "apply-banner";
+  const stale = applyStale();
+  if (stale) {
+    els.applyBanner.classList.add("stale");
+    els.applyBanner.innerHTML =
+      "⚠ 当前草稿与生成预览时的修订号 "
+      + `<b>${p.draft_revision}</b>`
+      + " 不一致（已保存为其他修订或存在未保存修改），请先「重新载入合并预览」"
+      + (state.savedRevision == null ? "" : `（服务器最新修订号 ${state.savedRevision}）`);
+  } else if (p.counts.conflict_items) {
+    els.applyBanner.classList.add("has-conflict");
+    els.applyBanner.innerHTML =
+      `🟣 有 <b>${p.counts.conflict_items}</b> 项差异与当前草稿冲突（已改动同一条款或其父级 / 子树），`
+      + "对应勾选项已禁用；冲突项只能在当前草稿中人工处理。";
+  } else {
+    els.applyBanner.classList.add("clean");
+    els.applyBanner.textContent = "无冲突：可勾选需要带入的变更后提交。";
+  }
+}
+
+function renderApplyItems(p) {
+  els.applyItems.innerHTML = "";
+  if (!p.items.length) {
+    const empty = document.createElement("div");
+    empty.className = "audit-empty";
+    empty.textContent = "旧版与新版之间没有可应用的条款差异（仅编号改写会在合并后自动重算）。";
+    els.applyItems.appendChild(empty);
+    return;
+  }
+  p.items.forEach((it) => {
+    const wrap = document.createElement("div");
+    wrap.className = "apply-item" + (it.conflict ? " is-conflict" : "");
+
+    const top = document.createElement("button");
+    top.type = "button";
+    top.className = "audit-row apply-top";
+    const oldLoc = it.locs.old ? auditLoc(it.locs.old)
+      : `<span class="audit-loc missing">无</span>`;
+    const newLoc = it.locs.new ? auditLoc(it.locs.new)
+      : `<span class="audit-loc missing">无</span>`;
+    const dLoc = it.locs.draft ? auditLoc(it.locs.draft)
+      : `<span class="audit-loc missing">无</span>`;
+    top.innerHTML =
+      auditKindTag(it.kind) +
+      `<span class="audit-locs">`
+      + `<span class="loc-col" title="旧版（基线）">${oldLoc}</span>`
+      + `<span class="audit-arrow">→</span>`
+      + `<span class="loc-col" title="新版（候选）">${newLoc}</span>`
+      + `<span class="audit-arrow">⇔</span>`
+      + `<span class="loc-col" title="当前草稿">${dLoc}</span>`
+      + `</span><span class="audit-msg">${esc(it.message)}</span>`;
+    top.addEventListener("click", () =>
+      applyLocate(it.clause_id, [it.clause_id]));
+    wrap.appendChild(top);
+
+    const checks = document.createElement("div");
+    checks.className = "apply-dims";
+    const sel = state.apply.selections.get(it.clause_id) || new Set();
+    it.dimensions.forEach((dim) => {
+      const lab = document.createElement("label");
+      lab.className = "apply-dim" + (dim.conflict ? " blocked" : "");
+      lab.title = dim.conflict
+        ? dim.conflict_reasons.join("；")
+        : `带入「${dim.label}」变更`;
+      lab.innerHTML =
+        `<input type="checkbox" data-cid="${it.clause_id}" `
+        + `data-dim="${dim.dim}"${dim.conflict ? " disabled" : ""}`
+        + `${sel.has(dim.dim) ? " checked" : ""} />`
+        + `<span>${esc(dim.label)}</span>`;
+      lab.querySelector("input").addEventListener("change", (e) => {
+        e.stopPropagation();
+        let cur = state.apply.selections.get(it.clause_id);
+        if (!cur) { cur = new Set(); state.apply.selections.set(it.clause_id, cur); }
+        if (e.target.checked) cur.add(dim.dim); else cur.delete(dim.dim);
+        if (!cur.size) state.apply.selections.delete(it.clause_id);
+        updateApplySummary();
+      });
+      checks.appendChild(lab);
+    });
+    wrap.appendChild(checks);
+
+    if (it.conflict) {
+      const reasons = document.createElement("div");
+      reasons.className = "apply-conflict-reasons";
+      reasons.textContent = "⛔ " + [...new Set(
+        it.dimensions.flatMap((d) => d.conflict_reasons))].join("；");
+      wrap.appendChild(reasons);
+    }
+    els.applyItems.appendChild(wrap);
+  });
+}
+
+function updateApplySummary() {
+  const p = state.apply.preview;
+  if (!p) return;
+  const pairs = applySelectedPairs();
+  const nDims = pairs.reduce((n, x) => n + x.dimensions.length, 0);
+  const blocked = p.counts.conflict_items;
+  els.applySummary.textContent =
+    `已勾选 ${nDims} 项变更（${pairs.length} 条条款）`
+    + (blocked ? ` · 冲突条目 ${blocked}` : "");
+  const selectable = [];
+  p.items.forEach((it) => {
+    const dims = it.dimensions.filter((d) => !d.conflict).map((d) => d.dim);
+    if (dims.length) selectable.push([it.clause_id, dims]);
+  });
+  const allOn = selectable.length > 0 && selectable.every(
+    ([cid, dims]) => {
+      const cur = state.apply.selections.get(cid);
+      return cur && dims.every((d) => cur.has(d));
+    });
+  els.applySelectAll.checked = allOn;
+  els.btnApplySubmit.disabled = state.apply.busy || nDims === 0 || applyStale();
+  els.btnApplySubmit.textContent = state.apply.busy
+    ? "合并校验中…"
+    : "✓ 应用勾选项到当前草稿（一次事务保存新修订）";
+}
+
+function renderApplySides(p) {
+  els.applySides.innerHTML = "";
+  const sec = document.createElement("div");
+  sec.className = "audit-sides";
+  sec.innerHTML =
+    `<div class="audit-section-title">三侧条款快照（旧版基线 → 新版候选 ⇔ 当前草稿；`
+    + `点击上方条目可定位三侧对应条款；删除条款置灰）</div>`;
+  const cols = document.createElement("div");
+  cols.className = "compare-cols apply-cols";
+  const mkCol = (sideKey, title, side) => {
+    const col = document.createElement("div");
+    col.className = "col";
+    col.innerHTML = `<div class="col-title">${esc(title)}</div>`;
+    const view = document.createElement("div");
+    view.className = "doc-view audit-doc apply-doc";
+    view.dataset.side = sideKey;
+    if (side.preamble) {
+      const pre = document.createElement("div");
+      pre.className = "preamble-block clause-block";
+      pre.dataset.cid = "preamble";
+      pre.textContent = side.preamble;
+      view.appendChild(pre);
+    }
+    side.result.forEach((c) => view.appendChild(vMakeBlock(c, "after", false)));
+    (side.deleted_clauses || []).forEach((mini) => {
+      const full = (side.clauses || []).find((c) => c.id === mini.id);
+      if (full) view.appendChild(vMakeBlock(full, "before", true));
+    });
+    col.appendChild(view);
+    return col;
+  };
+  cols.appendChild(mkCol("old", `旧版 v${p.sides.old.version_no}（基线）`, p.sides.old));
+  cols.appendChild(mkCol("new", `新版 v${p.sides.new.version_no}（候选）`, p.sides.new));
+  cols.appendChild(mkCol("draft", "当前草稿", p.sides.draft));
+  sec.appendChild(cols);
+  els.applySides.appendChild(sec);
+}
+
+function applyLocate(cid, alsoIds = []) {
+  const box = els.applySides;
+  const sides = state.apply.preview
+    ? [state.apply.preview.sides.old, state.apply.preview.sides.new,
+       state.apply.preview.sides.draft] : [];
+  let scrolled = false;
+  box.querySelectorAll(".apply-doc").forEach((view, i) => {
+    const valid = new Set(sides[i] ? [
+      ...sides[i].order,
+      ...(sides[i].deleted_clauses || []).map((c) => c.id),
+      "preamble",
+    ] : []);
+    const ids = [cid, ...alsoIds].filter((x) => valid.has(x));
+    view.querySelectorAll(".clause-block").forEach((node) => {
+      if (ids.includes(node.dataset.cid)) {
+        if (!scrolled) {
+          node.scrollIntoView({ behavior: "smooth", block: "center" });
+          scrolled = true;
+        }
+        node.classList.remove("flash");
+        void node.offsetWidth;
+        node.classList.add("flash");
+      }
+    });
+  });
+  setTimeout(() => box.querySelectorAll(".clause-block.flash")
+    .forEach((n) => n.classList.remove("flash")), 2400);
+}
+
+function renderApplyBlockers(payload) {
+  const detail = payload && payload.detail;
+  const banner = els.applyBanner;
+  banner.className = "apply-banner rejected";
+  banner.innerHTML = "";
+  const head = document.createElement("div");
+  head.className = "apply-banner-head";
+  head.textContent = (detail && detail.message)
+    || "应用被拒绝（草稿未修改）";
+  banner.appendChild(head);
+
+  (detail.conflicts || []).forEach((cf) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "issue-blocker-row term";
+    row.innerHTML =
+      `<span class="chip-tag">冲突</span>`
+      + `<span class="chip-msg">${esc(cf.clause_id)} · `
+      + `${esc(APPLY_DIM_LABELS[cf.dimension] || cf.dimension)}：${esc(cf.message)}</span>`
+      + `<span class="chip-goto">定位 →</span>`;
+    row.addEventListener("click", () => applyLocate(cf.clause_id));
+    banner.appendChild(row);
+  });
+
+  const blockers = detail.blockers;
+  if (blockers) {
+    (blockers.reference_issues || []).forEach((it) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `issue-blocker-row ref ${it.type}`;
+      row.innerHTML =
+        `<span class="chip-tag">${(ISSUE_META[it.type] || {}).tag || it.type}</span>`
+        + `<span class="chip-msg">${esc(it.message)}</span>`
+        + `<span class="chip-goto">前往引用重排页定位 →</span>`;
+      row.addEventListener("click", () => {
+        switchMode("refs").then(() => locate(it.clause_id, it.target_id));
+      });
+      banner.appendChild(row);
+    });
+    (blockers.term_issues || []).forEach((it) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `issue-blocker-row term ${it.type}`;
+      row.innerHTML =
+        `<span class="chip-tag">${TERM_ISSUE_META[it.type].tag}</span>`
+        + `<span class="chip-msg">${esc(it.message)}</span>`
+        + `<span class="chip-goto">前往术语审校页定位 →</span>`;
+      row.addEventListener("click", () => {
+        switchMode("terms").then(() => locateTerm(it.occ_id));
+      });
+      banner.appendChild(row);
+    });
+  }
+  banner.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function submitApply() {
+  const p = state.apply.preview;
+  if (!p || state.apply.busy) return;
+  const pairs = applySelectedPairs();
+  if (!pairs.length) { toast("请先勾选要带入的变更"); return; }
+  if (applyStale()) { toast("预览已过期，请先重新载入合并预览"); return; }
+  state.apply.busy = true;
+  updateApplySummary();
+  try {
+    const res = await api(
+      `/api/drafts/${state.currentDraftId}/apply-audit`, {
+        method: "POST",
+        body: JSON.stringify({
+          old_version_id: state.audit.oldId,
+          new_version_id: state.audit.newId,
+          revision: p.draft_revision,
+          old_fingerprint: p.old.fingerprint,
+          new_fingerprint: p.new.fingerprint,
+          selections: pairs,
+        }),
+      });
+    // 通过：一次事务已保存新修订，用返回的草稿刷新工作区（不再另行 PUT）
+    els.input.value = res.draft.content;
+    state.order = res.draft.order;
+    state.deleted = res.draft.deleted;
+    state.termIgnores = res.draft.term_ignores || [];
+    state.savedRevision = res.revision;
+    state.previewSel = [];
+    state.previewResult = null;
+    state.previewStale = false;
+    els.previewPane.classList.add("hidden");
+    await runAnalyze(true);
+    state.savedSnapshot = draftSnapshot();
+    refreshDrafts(state.currentDraftId);
+    renderIssuePanel();
+    await refreshVersionList();
+    toast(`已应用 ${pairs.length} 条条款的勾选变更，草稿保存为修订 ${res.revision}`);
+    await fetchApplyPreview();
+  } catch (e) {
+    if (e.status === 409) {
+      const cur = e.payload && e.payload.detail && e.payload.detail.current_revision;
+      const banner = els.applyBanner;
+      banner.className = "apply-banner rejected";
+      banner.innerHTML =
+        `<div class="apply-banner-head">${esc(e.message)}</div>`;
+      const reload = document.createElement("button");
+      reload.type = "button";
+      reload.className = "btn btn-sm";
+      reload.textContent = `载入服务器最新草稿（修订号 ${cur ?? "?"}）后重试`;
+      reload.addEventListener("click", async () => {
+        await loadDraft(state.currentDraftId);
+        await fetchApplyPreview();
+      });
+      banner.appendChild(reload);
+      banner.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else if (e.status === 422) {
+      renderApplyBlockers(e.payload);
+      // 冲突 / 阻塞均不写库：重新拉预览确认服务端草稿修订未变
+      await fetchApplyPreview();
+    } else {
+      toast("应用失败：" + e.message);
+      updateApplySummary();
+    }
+  } finally {
+    state.apply.busy = false;
+    updateApplySummary();
+  }
+}
 async function refreshDrafts(selectId) {
   try {
     const drafts = await api("/api/drafts");
@@ -2151,8 +2560,10 @@ async function loadDraft(id) {
   state.activeVersion = null;
   state.versionsLoadedFor = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
+  state.apply = { busy: false, preview: null, selections: new Map(), seen: false };
   els.versionViewer.classList.add("hidden");
   els.auditResult.classList.add("hidden");
+  els.applyPane.classList.add("hidden");
   els.auditStatus.textContent = "";
   els.issueBlockers.classList.add("hidden");
   els.issueSuccess.classList.add("hidden");
@@ -2249,12 +2660,14 @@ function loadExample() {
   state.versionsLoadedFor = null;
   state.activeVersion = null;
   state.audit = { oldId: null, newId: null, result: null, busy: false };
+  state.apply = { busy: false, preview: null, selections: new Map(), seen: false };
   state.previewSel = [];
   state.previewResult = null;
   state.previewStale = false;
   els.previewPane.classList.add("hidden");
   els.versionViewer.classList.add("hidden");
   els.auditResult.classList.add("hidden");
+  els.applyPane.classList.add("hidden");
   els.auditStatus.textContent = "";
   renderAuditForm();
   els.draftSelect.value = "";
@@ -2282,6 +2695,22 @@ els.tabTerms.addEventListener("click", () => switchMode("terms"));
 els.tabVersions.addEventListener("click", () => switchMode("versions"));
 els.btnIssue.addEventListener("click", issueVersion);
 els.btnAudit.addEventListener("click", runAudit);
+els.btnApplyFetch.addEventListener("click", fetchApplyPreview);
+els.btnApplySubmit.addEventListener("click", submitApply);
+els.applySelectAll.addEventListener("change", () => {
+  const p = state.apply.preview;
+  if (!p) return;
+  if (els.applySelectAll.checked) {
+    p.items.forEach((it) => {
+      const dims = it.dimensions.filter((d) => !d.conflict).map((d) => d.dim);
+      if (dims.length) state.apply.selections.set(it.clause_id, new Set(dims));
+    });
+  } else {
+    state.apply.selections.clear();
+  }
+  renderApplyItems(p);
+  updateApplySummary();
+});
 els.auditOld.addEventListener("change", () => {
   state.audit.oldId = Number(els.auditOld.value) || null;
   renderAuditForm();
@@ -2305,6 +2734,11 @@ els.input.addEventListener("input", () => {
   if (state.previewResult) invalidatePreview();
   // 生效版本页的修订号提示同步更新（未保存修改）
   if (state.mode === "versions") renderIssuePanel();
+  // 合并应用预览：草稿变脏后旧结果标记过期，禁止提交
+  if (state.apply.preview) {
+    renderApplyBanner(state.apply.preview);
+    updateApplySummary();
+  }
 });
 
 // 删除影响预演

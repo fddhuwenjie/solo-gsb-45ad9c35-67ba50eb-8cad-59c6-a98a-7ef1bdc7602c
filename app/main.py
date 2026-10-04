@@ -23,6 +23,11 @@ from .issuance import (
     validate_snapshot,
 )
 from .audit import audit_versions
+from .merge import (
+    MergeConflict,
+    apply_merge,
+    build_apply_preview,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "..", "data"))
@@ -456,6 +461,170 @@ def audit(req: AuditRequest) -> dict:
         return audit_versions(old_row, new_row)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ApplySelection(BaseModel):
+    clause_id: str
+    dimensions: list[str] = Field(default_factory=list)
+
+
+class ApplyAuditPreviewRequest(BaseModel):
+    """应用到当前草稿（预览）：只读，返回可勾选条目 / 冲突 / 三侧快照。"""
+    old_version_id: int
+    new_version_id: int
+
+
+class ApplyAuditRequest(BaseModel):
+    """应用到当前草稿（提交）：乐观锁 + 两版本快照校验，一次事务落库。"""
+    old_version_id: int
+    new_version_id: int
+    revision: int
+    old_fingerprint: str
+    new_fingerprint: str
+    selections: list[ApplySelection] = Field(default_factory=list)
+
+
+def _load_apply_versions(conn: sqlite3.Connection,
+                         old_id: int, new_id: int,
+                         draft_id: int) -> tuple:
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT * FROM versions WHERE id IN (?, ?)", (old_id, new_id)
+        ).fetchall()
+    }
+    old_row, new_row = rows.get(old_id), rows.get(new_id)
+    if old_row is None or new_row is None:
+        missing = old_id if old_row is None else new_id
+        raise HTTPException(status_code=404, detail=f"版本不存在：{missing}")
+    if old_id == new_id:
+        raise HTTPException(status_code=400, detail="请选择两个不同的版本")
+    if old_row["draft_id"] != draft_id or new_row["draft_id"] != draft_id:
+        raise HTTPException(status_code=400,
+                            detail="只能把该草稿自己签发的版本应用到当前草稿")
+    return old_row, new_row
+
+
+@app.post("/api/drafts/{draft_id}/apply-preview")
+def apply_preview(draft_id: int, req: ApplyAuditPreviewRequest) -> dict:
+    """应用到当前草稿的只读预览：以旧版为基线、新版为候选逐条比对草稿。
+
+    不写任何状态；草稿不存在 → 404，版本异常 → 400/404。
+    """
+    with db() as conn:
+        drow = conn.execute(
+            "SELECT * FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if drow is None:
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        old_row, new_row = _load_apply_versions(
+            conn, req.old_version_id, req.new_version_id, draft_id)
+        draft = _draft_payload(drow)
+    return build_apply_preview(old_row, new_row, draft)
+
+
+@app.post("/api/drafts/{draft_id}/apply-audit")
+def apply_audit_to_draft(draft_id: int, req: ApplyAuditRequest) -> dict:
+    """把审计差异按勾选应用到当前草稿。
+
+    全部校验在写库前完成，过期 / 阻塞 / 任一冲突均整体拒绝且不写部分结果；
+    通过后在 ``BEGIN IMMEDIATE`` 单事务内保存为草稿的新修订（revision+1）。
+    """
+    import json
+
+    with db() as conn:
+        drow = conn.execute(
+            "SELECT * FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if drow is None:
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        old_row, new_row = _load_apply_versions(
+            conn, req.old_version_id, req.new_version_id, draft_id)
+
+        if old_row["fingerprint"] != req.old_fingerprint \
+                or new_row["fingerprint"] != req.new_fingerprint:
+            raise HTTPException(status_code=409, detail={
+                "message": "审计版本快照与当前签发版本不一致（版本行已变化），"
+                           "请重新生成审计与应用预览",
+                "current_revision": drow["revision"],
+            })
+
+        draft = _draft_payload(drow)
+
+        # 1) 计算合并（尚未加锁、尚未写库）：选择冲突 / 非法在此整体拒绝
+        try:
+            merged = apply_merge(
+                old_row, new_row, draft,
+                [s.model_dump() for s in req.selections])
+        except MergeConflict as exc:
+            raise HTTPException(status_code=422, detail={
+                "message": "存在与当前草稿冲突的勾选项，已整体拒绝（草稿未修改）",
+                "conflicts": exc.conflicts,
+            })
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        # 2) 合并结果重算后的阻塞项（引用 / 术语；术语阻塞扣除草稿既有忽略项）
+        ignore_set = set(draft["term_ignores"])
+        blockers = {
+            "reference_issues": list(merged["ref_result"]["issues"]),
+            "term_issues": [
+                it for it in merged["term_result"]["issues"]
+                if it["occ_id"] not in ignore_set
+            ],
+        }
+        if blockers["reference_issues"] or blockers["term_issues"]:
+            raise HTTPException(status_code=422, detail={
+                "message": "合并后的草稿仍有未通过的引用或术语问题，"
+                           "已整体拒绝（草稿未修改）",
+                "blockers": blockers,
+                "conflicts": [],
+            })
+
+        # 3) 加事务锁后复查修订号：校验期间草稿被改 → 409 回滚
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "SELECT revision FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()
+        if cur is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="草稿不存在")
+        current_rev = cur[0]
+        if current_rev != req.revision or current_rev != draft["revision"]:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail={
+                "message": "草稿在校验期间已被修改（修订号变化），"
+                           "已拒绝应用且未写入任何内容",
+                "current_revision": current_rev,
+            })
+
+        now = int(time.time())
+        conn.execute(
+            "UPDATE drafts SET title=?, content=?, order_json=?, "
+            "deleted_json=?, term_ignores_json=?, "
+            "revision=revision+1, updated_at=? WHERE id=?",
+            (merged["title"], merged["content"],
+             json.dumps(merged["order"], ensure_ascii=False),
+             json.dumps(merged["deleted"], ensure_ascii=False),
+             json.dumps(merged["term_ignores"], ensure_ascii=False),
+             now, draft_id),
+        )
+        new_rev = conn.execute(
+            "SELECT revision FROM drafts WHERE id=?", (draft_id,)
+        ).fetchone()[0]
+        conn.commit()
+
+    return {
+        "ok": True,
+        "revision": new_rev,
+        "applied": merged["applied"],
+        "draft": {
+            "content": merged["content"],
+            "order": merged["order"],
+            "deleted": merged["deleted"],
+            "term_ignores": merged["term_ignores"],
+        },
+    }
 
 
 # ---------------------------------------------------------------- 静态页面

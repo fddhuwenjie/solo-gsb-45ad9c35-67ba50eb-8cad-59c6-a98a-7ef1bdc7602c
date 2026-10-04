@@ -658,3 +658,48 @@ textarea:focus { outline: none; border-color: var(--primary); }
 .audit-doc .clause-block.flash {
   outline: 2px solid var(--flash); background: rgba(255,243,196,.12);
 }
+
+/* ---------------------------------------------------------------- 应用到当前草稿 */
+.apply-pane {
+  margin-top: 14px; padding: 14px; border: 1px solid var(--border);
+  border-radius: 12px; background: rgba(255,255,255,.02);
+}
+.apply-banner {
+  margin: 8px 0 12px; padding: 10px 12px; border-radius: 8px;
+  font-size: 13px; line-height: 1.6;
+  border: 1px solid var(--border);
+}
+.apply-banner.clean { border-color: var(--ok, #2f9e6e); color: #a8e8c8; background: rgba(47,158,110,.08); }
+.apply-banner.has-conflict { border-color: var(--purple); color: #d8c8ff; background: rgba(139,92,246,.10); }
+.apply-banner.stale { border-color: var(--warn, #d99a23); color: #ffe2a8; background: rgba(217,154,35,.10); }
+.apply-banner.rejected { border-color: var(--danger); color: #ffc4c4; background: rgba(231,76,60,.08); }
+.apply-banner-head { font-weight: 600; margin-bottom: 6px; }
+.apply-banner .issue-blocker-row { width: 100%; margin-top: 6px; }
+.apply-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.apply-selectall { font-size: 13px; color: var(--muted); cursor: pointer; }
+.apply-summary { font-size: 13px; color: var(--muted); flex: 1; }
+.apply-items { display: flex; flex-direction: column; gap: 8px; }
+.apply-item {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 8px 10px; background: rgba(255,255,255,.02);
+}
+.apply-item.is-conflict { border-color: var(--purple); background: rgba(139,92,246,.06); }
+.apply-top { width: 100%; justify-content: flex-start; text-align: left; }
+.apply-top .audit-locs .loc-col { min-width: 52px; }
+.apply-dims { display: flex; gap: 14px; flex-wrap: wrap; padding: 6px 10px 2px; }
+.apply-dim {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+  cursor: pointer; color: var(--text);
+}
+.apply-dim.blocked { color: var(--muted); cursor: not-allowed; }
+.apply-conflict-reasons {
+  margin: 4px 10px 6px; font-size: 12px; color: #e7b8ff;
+  line-height: 1.6;
+}
+.apply-sides { margin-top: 16px; }
+.apply-cols { grid-template-columns: 1fr 1fr 1fr; }
+.apply-doc { max-height: 520px; overflow-y: auto; }
+@media (max-width: 1100px) { .apply-cols { grid-template-columns: 1fr; } }

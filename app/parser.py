@@ -87,6 +87,18 @@ def parse_path(token: str) -> tuple[int, ...] | None:
 
 
 @dataclass
+class Block:
+    """一次成功匹配的条款标记（编号 token 级信息，正文尚未切出）。"""
+    match: re.Match
+    kind: str            # article | plain
+    path: tuple[int, ...]
+    label: str
+    start: int           # 整块起点（跳过换行与前导空白）
+    end: int             # 到下一条款起点（含尾随换行/空白）
+    content_end: int     # rstrip 换行后的整块末尾（Clause.raw 用）
+
+
+@dataclass
 class Clause:
     id: str            # 稳定 ID：路径 slug，重复时由调用方加后缀
     path: tuple[int, ...]
@@ -95,6 +107,9 @@ class Clause:
     text: str          # 编号之后的正文（不含编号标记）
     heading: str       # 正文首行（列表展示用）
     raw: str           # 含编号的整块原文（本条款到下一条款之间）
+    start: int = 0     # 整块在原文中的字符起点（跳过前导空白）
+    end: int = 0       # 到下一条款起点（含尾随换行；末条为文本长度）
+    content_end: int = 0  # rstrip 换行后的整块末尾
 
 
 def _make_id(path: tuple[int, ...]) -> str:
@@ -107,12 +122,13 @@ def _block_start(text: str, m: re.Match) -> int:
     return start + len(m.group("lead") or "")
 
 
-def parse_contract(text: str) -> tuple[str, list[Clause]]:
-    """切分合同文本，返回 (前置说明 preamble, 条款列表)。"""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    clauses: list[Clause] = []
-    used_ids: set[str] = set()
+def split_blocks(text: str) -> tuple[str, list[Block]]:
+    """切出 (前置说明, 条款标记块列表)，块带在原文中的字符区间。
 
+    与 :func:`parse_contract` 使用同一套匹配 / 过滤规则，区间供三方合并
+    在不重排空白的前提下做外科式文本替换。
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     matches = list(_BLOCK_RE.finditer(text))
     # 先筛出有效条款标记，伪匹配（如行首 100、年份串）留在正文中
     accepted: list[tuple[re.Match, str, tuple[int, ...], str]] = []
@@ -130,17 +146,40 @@ def parse_contract(text: str) -> tuple[str, list[Clause]]:
                 continue
             accepted.append((m, "plain", segs, token + (m.group("sep") or "")))
 
+    blocks: list[Block] = []
     for idx, (m, kind, path, label) in enumerate(accepted):
         block_start = _block_start(text, m)
         block_end = (_block_start(text, accepted[idx + 1][0])
                      if idx + 1 < len(accepted) else len(text))
-        body = text[m.end():block_end]
+        blocks.append(Block(
+            match=m, kind=kind, path=path, label=label,
+            start=block_start, end=block_end,
+            content_end=block_end
+            - (len(text[block_start:block_end])
+               - len(text[block_start:block_end].rstrip("\n"))),
+        ))
+
+    first_start = _block_start(text, accepted[0][0]) if accepted else len(text)
+    preamble = text[:first_start].strip()
+    return preamble, blocks
+
+
+def parse_contract(text: str) -> tuple[str, list[Clause]]:
+    """切分合同文本，返回 (前置说明 preamble, 条款列表)。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    preamble, blocks = split_blocks(text)
+    clauses: list[Clause] = []
+    used_ids: set[str] = set()
+
+    for b in blocks:
+        m = b.match
+        body = text[m.end():b.end]
         body = body.lstrip(" \t　")
         heading = body.strip().split("\n", 1)[0].strip()
         if len(heading) > 40:
             heading = heading[:40] + "…"
 
-        cid = _make_id(path)
+        cid = _make_id(b.path)
         if cid in used_ids:
             n = 2
             while f"{cid}-{n}" in used_ids:
@@ -149,11 +188,10 @@ def parse_contract(text: str) -> tuple[str, list[Clause]]:
         used_ids.add(cid)
 
         clauses.append(Clause(
-            id=cid, path=path, label=label, kind=kind,
+            id=cid, path=b.path, label=b.label, kind=b.kind,
             text=body, heading=heading,
-            raw=text[block_start:block_end].rstrip("\n"),
+            raw=text[b.start:b.content_end].rstrip("\n"),
+            start=b.start, end=b.end, content_end=b.content_end,
         ))
 
-    first_start = _block_start(text, accepted[0][0]) if accepted else len(text)
-    preamble = text[:first_start].strip()
     return preamble, clauses
